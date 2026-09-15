@@ -1,0 +1,72 @@
+# Build directories
+build/
+bin/
+out/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled files
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test files (except test_main.cc)
+test_*.cc
+!test_main.cc
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+# Compiler files
+*.d
+*.ii
+*.s
+*.bc
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Coverage
+*.gcov
+*.gcda
+*.gcno
+coverage/
+htmlcov/
+
+# Dependencies
+.deps/
+
+# Package manager
+package-lock.json
+yarn.lock
