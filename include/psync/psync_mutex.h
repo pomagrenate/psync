@@ -6,15 +6,9 @@
 // Compilers: GCC, Clang, MSVC
 
 #include "psync_platform.h"
+#include "psync_locks.h"
 
 namespace psync {
-
-// ============================================================================
-// DEFER LOCK TAG
-// ============================================================================
-
-struct defer_lock_t {};
-static constexpr defer_lock_t defer_lock{};
 
 // Forward declaration for ConditionVariable
 class ConditionVariable;
@@ -147,73 +141,41 @@ private:
                 continue;
             }
             
-            // After threshold, add waiter and sleep
-            // Use CAS to atomically add waiter AND check if lock is still locked
-            // This prevents lost wakeups
+            // After threshold, register as waiter and sleep
+            atomic_fetch_add(&state_, WAITER_INCREMENT, MemoryOrder::relaxed);
+            
             while (true) {
                 u32 current = atomic_load(&state_, MemoryOrder::relaxed);
                 
-                // If lock is unlocked, try to acquire it directly
+                // If lock is unlocked, acquire it AND decrement our waiter count
                 if ((current & LOCKED_FLAG) == 0) {
-                    u32 expected = UNLOCKED;
+                    u32 new_state = (current - WAITER_INCREMENT) | LOCKED_FLAG;
+                    u32 expected = current;
                     if (atomic_compare_exchange(
                         &state_,
                         &expected,
-                        LOCKED_NO_WAITERS,
+                        new_state,
                         MemoryOrder::acquire,
                         MemoryOrder::relaxed
                     )) {
-                        // Successfully acquired lock
+                        // Successfully acquired lock and removed waiter
                         return;
                     }
                     // CAS failed, retry
                     continue;
                 }
                 
-                // Lock is still locked, try to add waiter count
-                u32 new_state = current + WAITER_INCREMENT;
-                u32 expected = current;
-                if (atomic_compare_exchange(
-                    &state_,
-                    &expected,
-                    new_state,
-                    MemoryOrder::relaxed,
-                    MemoryOrder::relaxed
-                )) {
-                    // Successfully added waiter, now sleep
-                    // Re-check current state for futex wait
-                    current = atomic_load(&state_, MemoryOrder::relaxed);
-                    futex::wait(&state_, current);
-                    break;
-                }
-                // CAS failed, retry
+                // Lock is held, wait on futex
+                futex::wait(&state_, current);
             }
-            
-            // After wake, reset backoff and retry
-            spin_count = 0;
-            backoff = SPIN_INITIAL;
         }
     }
     
     // Contended unlock with waiter wake
     void unlock_contended(u32 current) {
+        (void)current;
         // Clear locked flag atomically
-        while (true) {
-            u32 new_state = current & ~LOCKED_FLAG;
-            
-            u32 expected = current;
-            if (atomic_compare_exchange(
-                &state_,
-                &expected,
-                new_state,
-                MemoryOrder::release,
-                MemoryOrder::relaxed
-            )) {
-                // Successfully updated state
-                break;
-            }
-            current = expected;
-        }
+        atomic_fetch_and(&state_, ~LOCKED_FLAG, MemoryOrder::release);
         
         // Wake one waiter if there are any
         futex::wake(&state_, 1);
@@ -221,95 +183,6 @@ private:
     
     // Allow ConditionVariable to access get_state_address
     friend class ConditionVariable;
-};
-
-// ============================================================================
-// LOCK GUARD (RAII)
-// ============================================================================
-
-class LockGuard {
-public:
-    explicit LockGuard(Mutex& mutex) : mutex_(mutex) {
-        mutex_.lock();
-    }
-    
-    ~LockGuard() {
-        mutex_.unlock();
-    }
-    
-    // Disable copy and move
-    LockGuard(const LockGuard&) = delete;
-    LockGuard& operator=(const LockGuard&) = delete;
-    
-private:
-    Mutex& mutex_;
-};
-
-// ============================================================================
-// UNIQUE LOCK (RAII with unlock/lock capabilities)
-// ============================================================================
-
-class UniqueLock {
-public:
-    explicit UniqueLock(Mutex& mutex) : mutex_(&mutex), owns_(true) {
-        mutex_->lock();
-    }
-    
-    // Constructor for deferred locking
-    explicit UniqueLock(Mutex& mutex, std::defer_lock_t) : mutex_(&mutex), owns_(false) {}
-    
-    ~UniqueLock() {
-        if (owns_) {
-            mutex_->unlock();
-        }
-    }
-    
-    // Disable copy
-    UniqueLock(const UniqueLock&) = delete;
-    UniqueLock& operator=(const UniqueLock&) = delete;
-    
-    // Enable move
-    UniqueLock(UniqueLock&& other) noexcept : mutex_(other.mutex_), owns_(other.owns_) {
-        other.mutex_ = nullptr;
-        other.owns_ = false;
-    }
-    
-    UniqueLock& operator=(UniqueLock&& other) noexcept {
-        if (owns_) {
-            mutex_->unlock();
-        }
-        mutex_ = other.mutex_;
-        owns_ = other.owns_;
-        other.mutex_ = nullptr;
-        other.owns_ = false;
-        return *this;
-    }
-    
-    void lock() {
-        if (!owns_) {
-            mutex_->lock();
-            owns_ = true;
-        }
-    }
-    
-    void unlock() {
-        if (owns_) {
-            mutex_->unlock();
-            owns_ = false;
-        }
-    }
-    
-    bool owns_lock() const noexcept {
-        return owns_;
-    }
-    
-    Mutex* mutex() noexcept {
-        return mutex_;
-    }
-    
-private:
-    Mutex* mutex_;
-    bool owns_;
 };
 
 } // namespace psync

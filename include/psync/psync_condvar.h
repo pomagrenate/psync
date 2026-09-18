@@ -25,9 +25,24 @@ public:
     ConditionVariable(const ConditionVariable&) = delete;
     ConditionVariable& operator=(const ConditionVariable&) = delete;
     
-    // Wait on condition variable with predicate
-    // Must be called with mutex locked
-    // Predicate is re-checked atomically to avoid spurious wakeups
+    // Wait on condition variable with predicate using any Lock type (e.g. UniqueLock<Mutex>)
+    template<typename LockType, typename Predicate>
+    void wait(LockType& lock, Predicate pred) {
+        while (!pred()) {
+            wait(lock);
+        }
+    }
+
+    // Wait on condition variable using any Lock type (e.g. UniqueLock<Mutex>)
+    template<typename LockType>
+    void wait(LockType& lock) {
+        u32 current = atomic_fetch_or(&state_, WAITERS, MemoryOrder::relaxed);
+        lock.unlock();
+        futex::wait(&state_, current | WAITERS);
+        lock.lock();
+    }
+
+    // Wait on condition variable with predicate for raw Mutex
     template<typename Predicate>
     void wait(Mutex& mutex, Predicate pred) {
         while (!pred()) {
@@ -35,27 +50,22 @@ public:
         }
     }
     
-    // Wait on condition variable
-    // Must be called with mutex locked
-    // Caller must re-check predicate after wake (standard condition variable semantics)
+    // Wait on condition variable for raw Mutex
     void wait(Mutex& mutex) {
-        // Signal that we are waiting
         u32 current = atomic_fetch_or(&state_, WAITERS, MemoryOrder::relaxed);
-        
-        // Release mutex
         mutex.unlock();
-        
-        // Wait on futex
-        // This may return spuriously - caller must re-check predicate
         futex::wait(&state_, current | WAITERS);
-        
-        // Re-acquire mutex
         mutex.lock();
     }
     
     // Wake one waiting thread
     void signal() {
         futex::wake(&state_, 1);
+    }
+    
+    // Standard alias for signal()
+    void notify_one() {
+        signal();
     }
     
     // Wake all waiting threads
@@ -97,6 +107,15 @@ public:
     // Wake all waiting threads (simplified version without mutex)
     void broadcast() {
         futex::wake_all(&state_);
+    }
+
+    // Standard alias for broadcast()
+    void notify_all() {
+        broadcast();
+    }
+
+    void notify_all(Mutex& mutex) {
+        broadcast(mutex);
     }
     
 private:

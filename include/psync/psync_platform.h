@@ -26,6 +26,32 @@
     #endif
     #include <windows.h>
     #include <cstdint>
+
+    // Undefine intrusive Windows macros that collide with standard C++ APIs and methods
+    #ifdef DeleteFile
+    #undef DeleteFile
+    #endif
+    #ifdef CopyFile
+    #undef CopyFile
+    #endif
+    #ifdef CreateFile
+    #undef CreateFile
+    #endif
+    #ifdef MoveFile
+    #undef MoveFile
+    #endif
+    #ifdef GetObject
+    #undef GetObject
+    #endif
+    #ifdef Yield
+    #undef Yield
+    #endif
+    #ifdef min
+    #undef min
+    #endif
+    #ifdef max
+    #undef max
+    #endif
 #else
     #error "Unsupported platform"
 #endif
@@ -414,18 +440,34 @@ static bool s_initialized = false;
 static void init_futex_windows() {
     if (s_initialized) return;
     
-    HMODULE hkernel32 = GetModuleHandleA("kernel32.dll");
-    if (hkernel32) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+#endif
+    HMODULE hmod = GetModuleHandleA("kernelbase.dll");
+    if (!hmod) {
+        hmod = GetModuleHandleA("api-ms-win-core-synch-l1-2-0.dll");
+    }
+    if (!hmod) {
+        hmod = LoadLibraryA("api-ms-win-core-synch-l1-2-0.dll");
+    }
+    if (!hmod) {
+        hmod = GetModuleHandleA("kernel32.dll");
+    }
+    if (hmod) {
         s_wait_on_address = reinterpret_cast<WaitOnAddressFunc>(
-            GetProcAddress(hkernel32, "WaitOnAddress")
+            GetProcAddress(hmod, "WaitOnAddress")
         );
         s_wake_by_address_single = reinterpret_cast<WakeByAddressSingleFunc>(
-            GetProcAddress(hkernel32, "WakeByAddressSingle")
+            GetProcAddress(hmod, "WakeByAddressSingle")
         );
         s_wake_by_address_all = reinterpret_cast<WakeByAddressAllFunc>(
-            GetProcAddress(hkernel32, "WakeByAddressAll")
+            GetProcAddress(hmod, "WakeByAddressAll")
         );
     }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     
     s_initialized = true;
 }

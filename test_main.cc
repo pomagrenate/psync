@@ -16,14 +16,7 @@
 
 #define PSYNC_TEST_BUILD
 
-#include "include/psync/psync_platform.h"
-#include "include/psync/psync_mutex.h"
-#include "include/psync/psync_microlock.h"
-#include "include/psync/psync_seqlock.h"
-#include "include/psync/psync_shared.h"
-#include "include/psync/psync_batch.h"
-#include "include/psync/psync_condvar.h"
-#include "include/psync/psync_tagged_ptr.h"
+#include "include/psync/psync.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -339,6 +332,82 @@ static bool test_tagged_ptr_single_thread() {
 }
 
 // ============================================================================
+// GENERIC RAII LOCK TESTS
+// ============================================================================
+
+static bool test_generic_locks() {
+    Mutex m;
+    {
+        LockGuard<Mutex> g(m);
+        ASSERT_FALSE(m.try_lock());
+    }
+    ASSERT_TRUE(m.try_lock());
+    m.unlock();
+
+    {
+        UniqueLock<Mutex> u(m);
+        ASSERT_TRUE(u.owns_lock());
+        u.unlock();
+        ASSERT_FALSE(u.owns_lock());
+        u.lock();
+        ASSERT_TRUE(u.owns_lock());
+    }
+
+    {
+        UniqueLock<Mutex> def(m, defer_lock);
+        ASSERT_FALSE(def.owns_lock());
+        def.lock();
+        ASSERT_TRUE(def.owns_lock());
+    }
+
+    SharedMutex sm;
+    {
+        SharedLock<SharedMutex> sl(sm);
+        ASSERT_TRUE(sl.owns_lock());
+        // Can take multiple shared locks concurrently
+        SharedLock<SharedMutex> sl2(sm);
+        ASSERT_TRUE(sl2.owns_lock());
+        // Cannot take exclusive lock while shared held
+        ASSERT_FALSE(sm.try_lock());
+    }
+    ASSERT_TRUE(sm.try_lock());
+    sm.unlock();
+
+    {
+        UniqueLock<SharedMutex> ul(sm);
+        ASSERT_TRUE(ul.owns_lock());
+        ASSERT_FALSE(sm.try_lock_shared());
+    }
+
+    // Condition variable with UniqueLock
+    ConditionVariable cv;
+    {
+        UniqueLock<Mutex> lock(m);
+        cv.notify_one();
+        cv.notify_all();
+    }
+
+    return true;
+}
+
+// ============================================================================
+// ONCE FLAG / CALL ONCE TESTS
+// ============================================================================
+
+static bool test_once_flag_call_once() {
+    OnceFlag flag;
+    int counter = 0;
+    auto increment = [&]() { counter++; };
+
+    call_once(flag, increment);
+    call_once(flag, increment);
+    call_once(flag, increment);
+
+    ASSERT_EQ(counter, 1);
+    return true;
+}
+
+// ============================================================================
 // MAIN TEST RUNNER
 // ============================================================================
 
@@ -369,6 +438,12 @@ int main() {
     
     printf("\n--- Condition Variable Tests ---\n");
     TEST(condvar_single_thread);
+    
+    printf("\n--- Generic RAII Lock Tests ---\n");
+    TEST(generic_locks);
+
+    printf("\n--- OnceFlag / CallOnce Tests ---\n");
+    TEST(once_flag_call_once);
     
     printf("\n--- Tagged Pointer Tests ---\n");
     TEST(tagged_ptr_single_thread);

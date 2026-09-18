@@ -6,22 +6,18 @@
 // Compilers: GCC, Clang, MSVC
 
 #include "psync_platform.h"
+#include "psync_locks.h"
 
 namespace psync {
 
 // ============================================================================
-// DEFER LOCK TAG
-// ============================================================================
-
-struct defer_lock_t {};
-static constexpr defer_lock_t defer_lock{};
-
+// SHARED MUTEX STATE LAYOUT (32 bits)
 // ============================================================================
 // SHARED MUTEX STATE LAYOUT (32 bits)
 // ============================================================================
-// Bits 31-17: Reserved (future use)
-// Bits 16-1:  READER_COUNT (max 65535 readers)
-// Bit 0:      WRITER_LOCKED flag (1 = writer holds lock, 0 = no writer)
+// Bit 0:       WRITER_LOCKED flag (1 = writer holds lock, 0 = no writer)
+// Bits 1-15:   WRITER_WAITING (number of waiting writers, up to 32767)
+// Bits 16-31:  READER_COUNT (number of active readers, up to 65535)
 // ============================================================================
 
 class SharedMutex {
@@ -30,8 +26,13 @@ public:
     static constexpr u32 UNLOCKED = 0x00000000u;
     static constexpr u32 WRITER_LOCKED = 0x00000001u;
     static constexpr u32 WRITER_FLAG = 0x00000001u;
-    static constexpr u32 READER_SHIFT = 1;
-    static constexpr u32 READER_INCREMENT = 0x00000002u;  // 1 << READER_SHIFT
+    static constexpr u32 WRITER_WAITING_SHIFT = 1;
+    static constexpr u32 WRITER_WAITING_INC = 0x00000002u;
+    static constexpr u32 WRITER_WAITING_MASK = 0x0000FFFEu;
+    
+    static constexpr u32 READER_SHIFT = 16;
+    static constexpr u32 READER_INCREMENT = 0x00010000u;
+    static constexpr u32 READER_MASK = 0xFFFF0000u;
     static constexpr u32 MAX_READERS = 0x0000FFFFu;  // 65535 readers
     
     // Initialize shared mutex (trivial initialization)
@@ -76,7 +77,7 @@ public:
     // Release the mutex from exclusive (writer) access
     void unlock() {
         // Clear writer locked flag
-        atomic_store(&state_, UNLOCKED, MemoryOrder::release);
+        atomic_fetch_and(&state_, ~WRITER_LOCKED, MemoryOrder::release);
         
         // Wake all waiters (readers and writers)
         futex::wake_all(&state_);
@@ -88,9 +89,8 @@ public:
         u32 current = atomic_load(&state_, MemoryOrder::relaxed);
         
         while (true) {
-            // Check if writer is locked
-            if ((current & WRITER_FLAG) != 0) {
-                // Writer holds lock, wait
+            // If writer holds lock OR writers are waiting, go to slow path to prevent writer starvation
+            if ((current & (WRITER_LOCKED | WRITER_WAITING_MASK)) != 0) {
                 lock_shared_contended();
                 return;
             }
@@ -119,23 +119,27 @@ public:
     // Returns true if lock was acquired, false otherwise
     bool try_lock_shared() {
         u32 current = atomic_load(&state_, MemoryOrder::relaxed);
-        
-        // Check if writer is locked
-        if ((current & WRITER_FLAG) != 0) {
-            return false;
+        while (true) {
+            // Check if writer is locked or waiting
+            if ((current & (WRITER_LOCKED | WRITER_WAITING_MASK)) != 0) {
+                return false;
+            }
+            
+            // Try to increment reader count
+            u32 new_state = current + READER_INCREMENT;
+            u32 expected = current;
+            
+            if (atomic_compare_exchange(
+                &state_,
+                &expected,
+                new_state,
+                MemoryOrder::acquire,
+                MemoryOrder::relaxed
+            )) {
+                return true;
+            }
+            current = expected;
         }
-        
-        // Try to increment reader count
-        u32 new_state = current + READER_INCREMENT;
-        u32 expected = current;
-        
-        return atomic_compare_exchange(
-            &state_,
-            &expected,
-            new_state,
-            MemoryOrder::acquire,
-            MemoryOrder::relaxed
-        );
     }
     
     // Release the mutex from shared (reader) access
@@ -143,70 +147,100 @@ public:
         // Decrement reader count
         u32 prev = atomic_fetch_sub(&state_, READER_INCREMENT, MemoryOrder::release);
         
-        // If this was the last reader, wake potential writers
-        u32 reader_count = (prev >> READER_SHIFT) - 1;
-        if (reader_count == 0) {
-            futex::wake(&state_, 1);
+        // If this was the last reader and writers are waiting, wake them
+        u32 reader_count = ((prev & READER_MASK) >> READER_SHIFT) - 1;
+        if (reader_count == 0 && (prev & WRITER_WAITING_MASK) != 0) {
+            futex::wake_all(&state_);
         }
     }
     
 private:
     // Contended exclusive (writer) lock acquisition
     void lock_contended() {
+        // Register this writer as waiting
+        atomic_fetch_add(&state_, WRITER_WAITING_INC, MemoryOrder::relaxed);
+        
+        usize spin_count = 0;
+        usize backoff = SPIN_INITIAL;
+        
         while (true) {
-            // Adaptive spin
-            for (usize i = 0; i < SPIN_INITIAL; ++i) {
-                cpu_pause();
-                
-                // Try to acquire lock
-                u32 expected = UNLOCKED;
+            u32 current = atomic_load(&state_, MemoryOrder::relaxed);
+            
+            // Lock can be acquired if no writer holds it and no active readers
+            if ((current & (WRITER_LOCKED | READER_MASK)) == 0) {
+                u32 new_state = (current - WRITER_WAITING_INC) | WRITER_LOCKED;
+                u32 expected = current;
                 if (atomic_compare_exchange(
                     &state_,
                     &expected,
-                    WRITER_LOCKED,
+                    new_state,
                     MemoryOrder::acquire,
                     MemoryOrder::relaxed
                 )) {
-                    // Successfully acquired lock after spinning
                     return;
                 }
+                continue;
+            }
+            
+            // Adaptive spin before sleeping
+            if (spin_count < FUTEX_THRESHOLD) {
+                for (usize i = 0; i < backoff; ++i) {
+                    cpu_pause();
+                }
+                spin_count++;
+                backoff = (backoff * BACKOFF_MULTIPLIER > BACKOFF_MAX) ? BACKOFF_MAX : backoff * BACKOFF_MULTIPLIER;
+                continue;
             }
             
             // Wait on futex
-            u32 current = atomic_load(&state_, MemoryOrder::relaxed);
             futex::wait(&state_, current);
+            
+            // Reset spin count after waking up
+            spin_count = 0;
+            backoff = SPIN_INITIAL;
         }
     }
     
     // Contended shared (reader) lock acquisition
     void lock_shared_contended() {
+        usize spin_count = 0;
+        usize backoff = SPIN_INITIAL;
+        
         while (true) {
-            // Adaptive spin
-            for (usize i = 0; i < SPIN_INITIAL; ++i) {
-                cpu_pause();
-                
-                // Try to acquire read lock
-                u32 current = atomic_load(&state_, MemoryOrder::relaxed);
-                if ((current & WRITER_FLAG) == 0) {
-                    u32 new_state = current + READER_INCREMENT;
-                    u32 expected = current;
-                    
-                    if (atomic_compare_exchange(
-                        &state_,
-                        &expected,
-                        new_state,
-                        MemoryOrder::acquire,
-                        MemoryOrder::relaxed
-                    )) {
-                        // Successfully acquired read lock
-                        return;
-                    }
+            u32 current = atomic_load(&state_, MemoryOrder::relaxed);
+            
+            // Can acquire if no writer is locked AND no writers are waiting
+            if ((current & (WRITER_LOCKED | WRITER_WAITING_MASK)) == 0) {
+                u32 new_state = current + READER_INCREMENT;
+                u32 expected = current;
+                if (atomic_compare_exchange(
+                    &state_,
+                    &expected,
+                    new_state,
+                    MemoryOrder::acquire,
+                    MemoryOrder::relaxed
+                )) {
+                    return;
                 }
+                continue;
+            }
+            
+            // Adaptive spin before sleeping
+            if (spin_count < FUTEX_THRESHOLD) {
+                for (usize i = 0; i < backoff; ++i) {
+                    cpu_pause();
+                }
+                spin_count++;
+                backoff = (backoff * BACKOFF_MULTIPLIER > BACKOFF_MAX) ? BACKOFF_MAX : backoff * BACKOFF_MULTIPLIER;
+                continue;
             }
             
             // Wait on futex
-            u32 current = atomic_load(&state_, MemoryOrder::relaxed);
             futex::wait(&state_, current);
+            
+            // Reset spin count after waking up
+            spin_count = 0;
+            backoff = SPIN_INITIAL;
         }
     }
     
@@ -255,168 +289,6 @@ public:
     
 private:
     SharedMutex& mutex_;
-};
-
-// ============================================================================
-// UNIQUE LOCK (RAII with unlock/lock capabilities for shared mutex)
-// ============================================================================
-
-class UniqueLock {
-public:
-    explicit UniqueLock(SharedMutex& mutex) : mutex_(&mutex), owns_(true) {
-        mutex_->lock();
-    }
-    
-    // Constructor for deferred locking
-    explicit UniqueLock(SharedMutex& mutex, defer_lock_t) : mutex_(&mutex), owns_(false) {}
-    
-    ~UniqueLock() {
-        if (owns_) {
-            mutex_->unlock();
-        }
-    }
-    
-    // Disable copy
-    UniqueLock(const UniqueLock&) = delete;
-    UniqueLock& operator=(const UniqueLock&) = delete;
-    
-    // Enable move
-    UniqueLock(UniqueLock&& other) noexcept : mutex_(other.mutex_), owns_(other.owns_) {
-        other.mutex_ = nullptr;
-        other.owns_ = false;
-    }
-    
-    UniqueLock& operator=(UniqueLock&& other) noexcept {
-        if (owns_) {
-            mutex_->unlock();
-        }
-        mutex_ = other.mutex_;
-        owns_ = other.owns_;
-        other.mutex_ = nullptr;
-        other.owns_ = false;
-        return *this;
-    }
-    
-    void lock() {
-        if (!owns_) {
-            mutex_->lock();
-            owns_ = true;
-        }
-    }
-    
-    void unlock() {
-        if (owns_) {
-            mutex_->unlock();
-            owns_ = false;
-        }
-    }
-    
-    void lock_shared() {
-        if (!owns_) {
-            mutex_->lock_shared();
-            owns_ = true;
-        }
-    }
-    
-    void unlock_shared() {
-        if (owns_) {
-            mutex_->unlock_shared();
-            owns_ = false;
-        }
-    }
-    
-    bool owns_lock() const noexcept {
-        return owns_;
-    }
-    
-    SharedMutex* mutex() noexcept {
-        return mutex_;
-    }
-    
-private:
-    SharedMutex* mutex_;
-    bool owns_;
-};
-
-// ============================================================================
-// SHARED LOCK (RAII with unlock/lock capabilities for readers)
-// ============================================================================
-
-class SharedLock {
-public:
-    explicit SharedLock(SharedMutex& mutex) : mutex_(&mutex), owns_(true) {
-        mutex_->lock_shared();
-    }
-    
-    // Constructor for deferred locking
-    explicit SharedLock(SharedMutex& mutex, defer_lock_t) : mutex_(&mutex), owns_(false) {}
-    
-    ~SharedLock() {
-        if (owns_) {
-            mutex_->unlock_shared();
-        }
-    }
-    
-    // Disable copy
-    SharedLock(const SharedLock&) = delete;
-    SharedLock& operator=(const SharedLock&) = delete;
-    
-    // Enable move
-    SharedLock(SharedLock&& other) noexcept : mutex_(other.mutex_), owns_(other.owns_) {
-        other.mutex_ = nullptr;
-        other.owns_ = false;
-    }
-    
-    SharedLock& operator=(SharedLock&& other) noexcept {
-        if (owns_) {
-            mutex_->unlock_shared();
-        }
-        mutex_ = other.mutex_;
-        owns_ = other.owns_;
-        other.mutex_ = nullptr;
-        other.owns_ = false;
-        return *this;
-    }
-    
-    void lock() {
-        if (!owns_) {
-            mutex_->lock();
-            owns_ = true;
-        }
-    }
-    
-    void unlock() {
-        if (owns_) {
-            mutex_->unlock();
-            owns_ = false;
-        }
-    }
-    
-    void lock_shared() {
-        if (!owns_) {
-            mutex_->lock_shared();
-            owns_ = true;
-        }
-    }
-    
-    void unlock_shared() {
-        if (owns_) {
-            mutex_->unlock_shared();
-            owns_ = false;
-        }
-    }
-    
-    bool owns_lock() const noexcept {
-        return owns_;
-    }
-    
-    SharedMutex* mutex() noexcept {
-        return mutex_;
-    }
-    
-private:
-    SharedMutex* mutex_;
-    bool owns_;
 };
 
 } // namespace psync
