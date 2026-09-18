@@ -9,6 +9,13 @@
 
 namespace psync {
 
+// ============================================================================
+// DEFER LOCK TAG
+// ============================================================================
+
+struct defer_lock_t {};
+static constexpr defer_lock_t defer_lock{};
+
 // Forward declaration for ConditionVariable
 class ConditionVariable;
 
@@ -236,6 +243,73 @@ public:
     
 private:
     Mutex& mutex_;
+};
+
+// ============================================================================
+// UNIQUE LOCK (RAII with unlock/lock capabilities)
+// ============================================================================
+
+class UniqueLock {
+public:
+    explicit UniqueLock(Mutex& mutex) : mutex_(&mutex), owns_(true) {
+        mutex_->lock();
+    }
+    
+    // Constructor for deferred locking
+    explicit UniqueLock(Mutex& mutex, std::defer_lock_t) : mutex_(&mutex), owns_(false) {}
+    
+    ~UniqueLock() {
+        if (owns_) {
+            mutex_->unlock();
+        }
+    }
+    
+    // Disable copy
+    UniqueLock(const UniqueLock&) = delete;
+    UniqueLock& operator=(const UniqueLock&) = delete;
+    
+    // Enable move
+    UniqueLock(UniqueLock&& other) noexcept : mutex_(other.mutex_), owns_(other.owns_) {
+        other.mutex_ = nullptr;
+        other.owns_ = false;
+    }
+    
+    UniqueLock& operator=(UniqueLock&& other) noexcept {
+        if (owns_) {
+            mutex_->unlock();
+        }
+        mutex_ = other.mutex_;
+        owns_ = other.owns_;
+        other.mutex_ = nullptr;
+        other.owns_ = false;
+        return *this;
+    }
+    
+    void lock() {
+        if (!owns_) {
+            mutex_->lock();
+            owns_ = true;
+        }
+    }
+    
+    void unlock() {
+        if (owns_) {
+            mutex_->unlock();
+            owns_ = false;
+        }
+    }
+    
+    bool owns_lock() const noexcept {
+        return owns_;
+    }
+    
+    Mutex* mutex() noexcept {
+        return mutex_;
+    }
+    
+private:
+    Mutex* mutex_;
+    bool owns_;
 };
 
 } // namespace psync

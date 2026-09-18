@@ -25,6 +25,16 @@ public:
     ConditionVariable(const ConditionVariable&) = delete;
     ConditionVariable& operator=(const ConditionVariable&) = delete;
     
+    // Wait on condition variable with predicate
+    // Must be called with mutex locked
+    // Predicate is re-checked atomically to avoid spurious wakeups
+    template<typename Predicate>
+    void wait(Mutex& mutex, Predicate pred) {
+        while (!pred()) {
+            wait(mutex);
+        }
+    }
+    
     // Wait on condition variable
     // Must be called with mutex locked
     // Caller must re-check predicate after wake (standard condition variable semantics)
@@ -50,7 +60,6 @@ public:
     
     // Wake all waiting threads
     void broadcast(Mutex& mutex) {
-        (void)mutex;  // Suppress unused parameter warning
 #ifdef PSYNC_PLATFORM_LINUX
         // Linux: Use FUTEX_CMP_REQUEUE_PRIVATE for thundering herd mitigation
         u32 current = atomic_load(&state_, MemoryOrder::relaxed);
@@ -79,9 +88,15 @@ public:
             }
         }
 #else
+        (void)mutex; // Suppress unused parameter warning on Windows
         // Windows: Wake all (thundering herd on Windows is acceptable fallback)
         futex::wake_all(&state_);
 #endif
+    }
+    
+    // Wake all waiting threads (simplified version without mutex)
+    void broadcast() {
+        futex::wake_all(&state_);
     }
     
 private:
@@ -99,6 +114,12 @@ public:
     ConditionVariableGuard(ConditionVariable& cv, Mutex& mutex) 
         : cv_(cv), mutex_(mutex) {
         cv_.wait(mutex_);
+    }
+    
+    template<typename Predicate>
+    ConditionVariableGuard(ConditionVariable& cv, Mutex& mutex, Predicate pred) 
+        : cv_(cv), mutex_(mutex) {
+        cv_.wait(mutex, pred);
     }
     
     ~ConditionVariableGuard() {

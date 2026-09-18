@@ -10,6 +10,13 @@
 namespace psync {
 
 // ============================================================================
+// DEFER LOCK TAG
+// ============================================================================
+
+struct defer_lock_t {};
+static constexpr defer_lock_t defer_lock{};
+
+// ============================================================================
 // SHARED MUTEX STATE LAYOUT (32 bits)
 // ============================================================================
 // Bits 31-17: Reserved (future use)
@@ -248,6 +255,168 @@ public:
     
 private:
     SharedMutex& mutex_;
+};
+
+// ============================================================================
+// UNIQUE LOCK (RAII with unlock/lock capabilities for shared mutex)
+// ============================================================================
+
+class UniqueLock {
+public:
+    explicit UniqueLock(SharedMutex& mutex) : mutex_(&mutex), owns_(true) {
+        mutex_->lock();
+    }
+    
+    // Constructor for deferred locking
+    explicit UniqueLock(SharedMutex& mutex, defer_lock_t) : mutex_(&mutex), owns_(false) {}
+    
+    ~UniqueLock() {
+        if (owns_) {
+            mutex_->unlock();
+        }
+    }
+    
+    // Disable copy
+    UniqueLock(const UniqueLock&) = delete;
+    UniqueLock& operator=(const UniqueLock&) = delete;
+    
+    // Enable move
+    UniqueLock(UniqueLock&& other) noexcept : mutex_(other.mutex_), owns_(other.owns_) {
+        other.mutex_ = nullptr;
+        other.owns_ = false;
+    }
+    
+    UniqueLock& operator=(UniqueLock&& other) noexcept {
+        if (owns_) {
+            mutex_->unlock();
+        }
+        mutex_ = other.mutex_;
+        owns_ = other.owns_;
+        other.mutex_ = nullptr;
+        other.owns_ = false;
+        return *this;
+    }
+    
+    void lock() {
+        if (!owns_) {
+            mutex_->lock();
+            owns_ = true;
+        }
+    }
+    
+    void unlock() {
+        if (owns_) {
+            mutex_->unlock();
+            owns_ = false;
+        }
+    }
+    
+    void lock_shared() {
+        if (!owns_) {
+            mutex_->lock_shared();
+            owns_ = true;
+        }
+    }
+    
+    void unlock_shared() {
+        if (owns_) {
+            mutex_->unlock_shared();
+            owns_ = false;
+        }
+    }
+    
+    bool owns_lock() const noexcept {
+        return owns_;
+    }
+    
+    SharedMutex* mutex() noexcept {
+        return mutex_;
+    }
+    
+private:
+    SharedMutex* mutex_;
+    bool owns_;
+};
+
+// ============================================================================
+// SHARED LOCK (RAII with unlock/lock capabilities for readers)
+// ============================================================================
+
+class SharedLock {
+public:
+    explicit SharedLock(SharedMutex& mutex) : mutex_(&mutex), owns_(true) {
+        mutex_->lock_shared();
+    }
+    
+    // Constructor for deferred locking
+    explicit SharedLock(SharedMutex& mutex, defer_lock_t) : mutex_(&mutex), owns_(false) {}
+    
+    ~SharedLock() {
+        if (owns_) {
+            mutex_->unlock_shared();
+        }
+    }
+    
+    // Disable copy
+    SharedLock(const SharedLock&) = delete;
+    SharedLock& operator=(const SharedLock&) = delete;
+    
+    // Enable move
+    SharedLock(SharedLock&& other) noexcept : mutex_(other.mutex_), owns_(other.owns_) {
+        other.mutex_ = nullptr;
+        other.owns_ = false;
+    }
+    
+    SharedLock& operator=(SharedLock&& other) noexcept {
+        if (owns_) {
+            mutex_->unlock_shared();
+        }
+        mutex_ = other.mutex_;
+        owns_ = other.owns_;
+        other.mutex_ = nullptr;
+        other.owns_ = false;
+        return *this;
+    }
+    
+    void lock() {
+        if (!owns_) {
+            mutex_->lock();
+            owns_ = true;
+        }
+    }
+    
+    void unlock() {
+        if (owns_) {
+            mutex_->unlock();
+            owns_ = false;
+        }
+    }
+    
+    void lock_shared() {
+        if (!owns_) {
+            mutex_->lock_shared();
+            owns_ = true;
+        }
+    }
+    
+    void unlock_shared() {
+        if (owns_) {
+            mutex_->unlock_shared();
+            owns_ = false;
+        }
+    }
+    
+    bool owns_lock() const noexcept {
+        return owns_;
+    }
+    
+    SharedMutex* mutex() noexcept {
+        return mutex_;
+    }
+    
+private:
+    SharedMutex* mutex_;
+    bool owns_;
 };
 
 } // namespace psync
