@@ -75,6 +75,7 @@ using isize = ptrdiff_t;
 // MEMORY ORDERING
 // ============================================================================
 
+#if defined(__GNUC__) || defined(__clang__)
 enum class MemoryOrder {
     relaxed = __ATOMIC_RELAXED,
     acquire = __ATOMIC_ACQUIRE,
@@ -82,6 +83,14 @@ enum class MemoryOrder {
     acq_rel = __ATOMIC_ACQ_REL
     // seq_cst intentionally omitted from hot paths
 };
+#else
+enum class MemoryOrder {
+    relaxed = 0,
+    acquire = 2,
+    release = 3,
+    acq_rel = 4
+};
+#endif
 
 // ============================================================================
 // CPU INTRINSICS (x86-64)
@@ -347,6 +356,9 @@ inline i32 futex_syscall(
     volatile u32* uaddr2 = nullptr,
     u32 val3 = 0
 ) {
+    register i64 r10 __asm__("r10") = reinterpret_cast<i64>(timeout);
+    register i64 r8  __asm__("r8")  = reinterpret_cast<i64>(uaddr2);
+    register i64 r9  __asm__("r9")  = static_cast<i64>(val3);
     i32 result;
     __asm__ volatile(
         "syscall"
@@ -355,9 +367,9 @@ inline i32 futex_syscall(
           "D"(uaddr),
           "S"(futex_op),
           "d"(val),
-          "r"(timeout),
-          "r"(uaddr2),
-          "r"(val3)
+          "r"(r10),
+          "r"(r8),
+          "r"(r9)
         : "rcx", "r11", "memory"
     );
     return result;
@@ -371,6 +383,15 @@ inline i32 wait(volatile u32* uaddr, u32 val) {
     // EINTR = interrupted by signal (not an error)
     // We ignore errors and treat as spurious wakeup
     return result;
+}
+
+// Wait on futex if *uaddr == val with timeout in nanoseconds
+// Returns 0 on success, error code on failure
+inline i32 wait_for(volatile u32* uaddr, u32 val, u64 timeout_ns) {
+    timespec ts;
+    ts.tv_sec = static_cast<i64>(timeout_ns / 1000000000ull);
+    ts.tv_nsec = static_cast<i64>(timeout_ns % 1000000000ull);
+    return futex_syscall(uaddr, FUTEX_WAIT_PRIVATE, val, &ts);
 }
 
 // Wake up to count waiters on futex
@@ -390,20 +411,9 @@ inline i32 wake_all(volatile u32* uaddr) {
 // Uses FUTEX_CMP_REQUEUE_PRIVATE to verify condvar state before requeueing
 inline i32 requeue(volatile u32* uaddr, volatile u32* uaddr2, i32 count, u32 expected) {
 #ifdef PSYNC_PLATFORM_LINUX
-    i32 result;
-    __asm__ volatile(
-        "syscall"
-        : "=a"(result)
-        : "a"(SYS_FUTEX),
-          "D"(uaddr),
-          "S"(FUTEX_CMP_REQUEUE_PRIVATE),
-          "d"(1),              // Wake one
-          "r"(expected),       // Expected value at uaddr (cmp_requeue parameter)
-          "r"(uaddr2),
-          "r"(count)           // Requeue count
-        : "rcx", "r11", "memory"
-    );
-    return result;
+    return futex_syscall(uaddr, FUTEX_CMP_REQUEUE_PRIVATE, 1,
+                         reinterpret_cast<const timespec*>(static_cast<uintptr_t>(count)),
+                         uaddr2, expected);
 #else
     // Fallback for non-Linux: wake all (causes thundering herd)
     (void)expected;  // Suppress unused parameter warning
@@ -544,6 +554,39 @@ inline i32 wait(volatile u32* uaddr, u32 val) {
     }
 }
 
+// Wait on address if *uaddr == val with timeout in nanoseconds
+// Returns 0 on success, -1 on timeout/failure
+inline i32 wait_for(volatile u32* uaddr, u32 val, u64 timeout_ns) {
+    init_futex_windows();
+    DWORD ms = static_cast<DWORD>((timeout_ns + 999999ull) / 1000000ull);
+    if (ms == 0 && timeout_ns > 0) ms = 1;
+    
+    if (s_wait_on_address) {
+        BOOL result = s_wait_on_address(
+            const_cast<volatile void*>(reinterpret_cast<volatile void*>(uaddr)),
+            &val,
+            sizeof(u32),
+            ms
+        );
+        return result ? 0 : -1;
+    } else {
+        init_fallback_slots();
+        usize slot = hash_address(uaddr);
+        fallback_wait_state* state = &s_fallback_slots[slot];
+        AcquireSRWLockExclusive(&state->lock);
+        state->waiting = true;
+        if (atomic_load(uaddr, MemoryOrder::relaxed) != val) {
+            state->waiting = false;
+            ReleaseSRWLockExclusive(&state->lock);
+            return 0;
+        }
+        BOOL res = SleepConditionVariableSRW(&state->cond, &state->lock, ms, 0);
+        state->waiting = false;
+        ReleaseSRWLockExclusive(&state->lock);
+        return res ? 0 : -1;
+    }
+}
+
 // Wake up to count waiters on address
 // Returns number of waiters woken (approximate on Windows)
 inline i32 wake(volatile u32* uaddr, i32 count) {
@@ -655,64 +698,24 @@ using thread_handle = HANDLE;
 struct thread_context {
     void (*func)(void*);
     void* arg;
-    volatile bool started;  // Set to true when thread has copied arguments
 };
 
-DWORD WINAPI thread_wrapper(LPVOID param) {
+inline DWORD WINAPI thread_wrapper(LPVOID param) {
     thread_context* ctx = static_cast<thread_context*>(param);
-    
-    // Copy arguments to local stack before signaling parent
     void (*func)(void*) = ctx->func;
     void* arg = ctx->arg;
-    
-    // Signal parent that we've copied the arguments
-    ctx->started = true;
-    
-    // Execute the thread function with copied arguments
-    func(arg);
-    
-    // Clean up the context (we own it now)
     delete ctx;
-    
+    func(arg);
     return 0;
 }
 
 inline bool thread_create(thread_handle* handle, void (*func)(void*), void* arg) {
-    // Allocate thread context
-    thread_context* ctx = new thread_context{func, arg, false};
-    
-    // Create the thread
+    thread_context* ctx = new thread_context{func, arg};
     *handle = CreateThread(nullptr, 0, thread_wrapper, ctx, 0, nullptr);
-    
     if (*handle == nullptr) {
-        // Thread creation failed, clean up
         delete ctx;
         return false;
     }
-    
-    // Wait for child thread to copy arguments (prevent race)
-    // Spin wait with exponential backoff
-    int spin_count = 0;
-    while (!ctx->started) {
-        if (spin_count < 1000) {
-            // Spin for up to ~1ms
-            for (int i = 0; i < 100; ++i) {
-                cpu_pause();  // Use the platform-specific pause
-            }
-            spin_count++;
-        } else {
-            // After spinning, yield to scheduler
-            SwitchToThread();
-            if (spin_count > 2000) {
-                // Timeout - child thread failed to start
-                // We can't safely clean up ctx since child might still be using it
-                // The context will be cleaned up by the child thread eventually
-                return false;
-            }
-            spin_count++;
-        }
-    }
-    
     return true;
 }
 

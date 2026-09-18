@@ -6,124 +6,9 @@
 // Compilers: GCC, Clang, MSVC
 
 #include "psync_platform.h"
+#include "psync_microlock.h"
 
 namespace psync {
-
-// ============================================================================
-// MINIMAL PARKING LOT FOR TAGGED POINTER
-// ============================================================================
-
-class TaggedPtrParkingLot {
-public:
-    struct WaiterNode {
-        volatile u32 wake_flag;
-        WaiterNode* next;
-        
-        WaiterNode() : wake_flag(0), next(nullptr) {}
-    };
-    
-    struct Bucket {
-        volatile u32 lock_state;
-        WaiterNode* head;
-        WaiterNode* tail;
-        
-        Bucket() : lock_state(0), head(nullptr), tail(nullptr) {}
-    };
-    
-    static constexpr usize NUM_BUCKETS = 64;
-    
-    TaggedPtrParkingLot() {
-        for (usize i = 0; i < NUM_BUCKETS; ++i) {
-            buckets_[i].lock_state = 0;
-            buckets_[i].head = nullptr;
-            buckets_[i].tail = nullptr;
-        }
-    }
-    
-    bool park(void* lock_address, WaiterNode* node) {
-        usize bucket_index = hash_address(lock_address);
-        Bucket* bucket = &buckets_[bucket_index];
-        
-        lock_bucket(bucket);
-        
-        node->wake_flag = 0;
-        node->next = nullptr;
-        
-        if (bucket->tail) {
-            bucket->tail->next = node;
-        } else {
-            bucket->head = node;
-        }
-        bucket->tail = node;
-        
-        unlock_bucket(bucket);
-        
-        while (atomic_load(&node->wake_flag, MemoryOrder::relaxed) == 0) {
-            futex::wait(&node->wake_flag, 0);
-        }
-        
-        return true;
-    }
-    
-    bool unpark_one(void* lock_address) {
-        usize bucket_index = hash_address(lock_address);
-        Bucket* bucket = &buckets_[bucket_index];
-        
-        lock_bucket(bucket);
-        
-        WaiterNode* node = bucket->head;
-        if (node) {
-            bucket->head = node->next;
-            if (!bucket->head) {
-                bucket->tail = nullptr;
-            }
-            
-            atomic_store(&node->wake_flag, static_cast<u32>(1), MemoryOrder::release);
-            unlock_bucket(bucket);
-            futex::wake(&node->wake_flag, 1);
-            return true;
-        }
-        
-        unlock_bucket(bucket);
-        return false;
-    }
-    
-private:
-    static usize hash_address(void* address) {
-        usize addr = reinterpret_cast<usize>(address);
-        return (addr >> 3) & (NUM_BUCKETS - 1);
-    }
-    
-    void lock_bucket(Bucket* bucket) {
-        while (true) {
-            u32 expected = 0;
-            if (atomic_compare_exchange(
-                &bucket->lock_state,
-                &expected,
-                static_cast<u32>(1),
-                MemoryOrder::acquire,
-                MemoryOrder::relaxed
-            )) {
-                return;
-            }
-            for (usize i = 0; i < SPIN_INITIAL; ++i) {
-                cpu_pause();
-            }
-        }
-    }
-    
-    void unlock_bucket(Bucket* bucket) {
-        atomic_store(&bucket->lock_state, static_cast<u32>(0), MemoryOrder::release);
-    }
-    
-    Bucket buckets_[NUM_BUCKETS];
-};
-
-// Global parking lot instance
-inline TaggedPtrParkingLot& get_tagged_ptr_parking_lot() {
-    static TaggedPtrParkingLot instance;
-    return instance;
-}
 
 // ============================================================================
 // TAGGED LOCK POINTER
@@ -222,8 +107,8 @@ public:
             
             // Check if waiters present
             if ((current & WAITERS_BIT) != 0) {
-                // Clear locked bit and waiters bit, wake one waiter
-                u64 new_state = current & ~(LOCKED_BIT | WAITERS_BIT);
+                // Clear locked bit, leaving WAITERS_BIT intact
+                u64 new_state = current & ~LOCKED_BIT;
                 u64 expected = current;
                 if (atomic_compare_exchange(
                     &tagged_ptr_,
@@ -232,8 +117,13 @@ public:
                     MemoryOrder::release,
                     MemoryOrder::relaxed
                 )) {
-                    // Successfully unlocked, wake one waiter
-                    get_tagged_ptr_parking_lot().unpark_one(this);
+                    // Successfully released lock.
+                    // Under bucket lock, unpark one waiter and clear WAITERS_BIT if no more waiters remain.
+                    get_parking_lot().unpark_one(this, [this](ParkingLot::UnparkResult res) {
+                        if (res != ParkingLot::UnparkResult::HasMoreWaiters) {
+                            atomic_fetch_and(&tagged_ptr_, ~WAITERS_BIT, MemoryOrder::relaxed);
+                        }
+                    });
                     return;
                 }
                 // CAS failed, retry
@@ -299,7 +189,7 @@ private:
     // Contended lock acquisition with parking
     void lock_contended() {
         // Thread-local waiter node (stack allocated)
-        TaggedPtrParkingLot::WaiterNode node;
+        ParkingLot::WaiterNode node;
         
         while (true) {
             // Adaptive spin
@@ -346,32 +236,30 @@ private:
                     continue;
                 }
                 
-                // Lock is still locked, try to set waiters flag
+                // Lock is still locked, ensure waiters flag is set
                 if ((current & WAITERS_BIT) == 0) {
                     u64 new_state = current | WAITERS_BIT;
                     u64 expected = current;
-                    if (atomic_compare_exchange(
+                    if (!atomic_compare_exchange(
                         &tagged_ptr_,
                         &expected,
                         new_state,
                         MemoryOrder::relaxed,
                         MemoryOrder::relaxed
                     )) {
-                        // Successfully set waiters flag
-                        break;
+                        // CAS failed, retry
+                        continue;
                     }
-                    // CAS failed, retry
-                    continue;
                 }
                 
-                // Waiters flag already set, proceed to park
+                // Waiters flag is set, park in parking lot with validation under bucket lock
+                get_parking_lot().park(this, &node, [this]() {
+                    return (atomic_load(&tagged_ptr_, MemoryOrder::relaxed) & LOCKED_BIT) != 0;
+                });
                 break;
             }
             
-            // Park in parking lot
-            get_tagged_ptr_parking_lot().park(this, &node);
-            
-            // After wake, retry acquisition
+            // After wake or validation abort, retry acquisition
         }
     }
     

@@ -6,6 +6,7 @@
 // Compilers: GCC, Clang, MSVC
 
 #include "psync_platform.h"
+#include <type_traits>
 
 namespace psync {
 
@@ -51,19 +52,21 @@ public:
     
     // Begin a read operation
     // Returns the current sequence number
-    // If sequence is odd, retry (write in progress)
+    // If sequence is odd, pauses and retries (write in progress)
     u32 read_begin() const {
-        u32 seq;
-        do {
-            seq = atomic_load(&sequence_, MemoryOrder::acquire);
-        } while ((seq & 1) != 0);  // Retry if odd
-            
-        return seq;
+        while (true) {
+            u32 seq = atomic_load(&sequence_, MemoryOrder::acquire);
+            if ((seq & 1) == 0) {
+                return seq;
+            }
+            cpu_pause();
+        }
     }
     
     // Check if read snapshot is still valid
     // Returns true if sequence changed (snapshot invalid), false otherwise
     bool read_retry(u32 seq) const {
+        compiler_fence();
         u32 current = atomic_load(&sequence_, MemoryOrder::acquire);
         return current != seq;
     }
@@ -78,15 +81,16 @@ private:
 
 class SeqLockReadGuard {
 public:
-    explicit SeqLockReadGuard(const SeqLock& lock) : lock_(lock) {
-        do {
-            sequence_ = lock_.read_begin();
-        } while (lock_.read_retry(sequence_));
-    }
+    explicit SeqLockReadGuard(const SeqLock& lock) : lock_(lock), sequence_(lock_.read_begin()) {}
     
     // Check if the read snapshot is still valid
     bool retry() const {
         return lock_.read_retry(sequence_);
+    }
+    
+    // Restart read sequence for retry
+    void restart() {
+        sequence_ = lock_.read_begin();
     }
     
     // Disable copy and move
@@ -97,6 +101,30 @@ private:
     const SeqLock& lock_;
     u32 sequence_;
 };
+
+// ============================================================================
+// TRANSACTIONAL READ HELPER
+// ============================================================================
+
+// Execute a speculative read transaction until a consistent snapshot is obtained
+template<typename Func>
+decltype(auto) read_transaction(const SeqLock& lock, Func&& func) {
+    while (true) {
+        u32 seq = lock.read_begin();
+        if constexpr (std::is_void_v<std::invoke_result_t<Func>>) {
+            func();
+            if (!lock.read_retry(seq)) {
+                return;
+            }
+        } else {
+            auto result = func();
+            if (!lock.read_retry(seq)) {
+                return result;
+            }
+        }
+        cpu_pause();
+    }
+}
 
 // ============================================================================
 // SEQLOCK WRITE GUARD (RAII for writers)

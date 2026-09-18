@@ -82,6 +82,9 @@ public:
     }
 
     UniqueLock& operator=(UniqueLock&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
         if (owns_ && mutex_) {
             mutex_->unlock();
         }
@@ -184,6 +187,9 @@ public:
     }
 
     SharedLock& operator=(SharedLock&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
         if (owns_ && mutex_) {
             mutex_->unlock_shared();
         }

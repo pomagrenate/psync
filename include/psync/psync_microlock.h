@@ -28,10 +28,11 @@ class ParkingLot {
 public:
     // Waiter node (intrusive list)
     struct WaiterNode {
+        const void* key;
         volatile u32 wake_flag;
         WaiterNode* next;
         
-        WaiterNode() : wake_flag(0), next(nullptr) {}
+        WaiterNode() : key(nullptr), wake_flag(0), next(nullptr) {}
     };
     
     // Bucket containing waiter queue
@@ -46,6 +47,13 @@ public:
     // Number of buckets (power of 2 for efficient hashing)
     static constexpr usize NUM_BUCKETS = 64;
     
+    // Result of unpark_one operation
+    enum class UnparkResult {
+        None,             // No waiter found for this key
+        NoMoreWaiters,    // Successfully unparked one, no more waiters for this key
+        HasMoreWaiters    // Successfully unparked one, more waiters still exist for this key
+    };
+    
     // Initialize parking lot (trivial initialization)
     ParkingLot() {
         for (usize i = 0; i < NUM_BUCKETS; ++i) {
@@ -55,16 +63,24 @@ public:
         }
     }
     
-    // Park a thread waiting on a lock address
-    // Returns true if parked successfully, false if should retry
-    bool park(void* lock_address, WaiterNode* node) {
+    // Park a thread waiting on a lock address with validation callback
+    // Returns true if parked and woken, false if validation failed
+    template<typename ValidateFunc>
+    bool park(const void* lock_address, WaiterNode* node, ValidateFunc&& validate) {
         usize bucket_index = hash_address(lock_address);
         Bucket* bucket = &buckets_[bucket_index];
         
         // Lock the bucket
         lock_bucket(bucket);
         
+        // Validate condition while holding bucket lock to prevent lost wakeup
+        if (!validate()) {
+            unlock_bucket(bucket);
+            return false;
+        }
+        
         // Add waiter to queue
+        node->key = lock_address;
         node->wake_flag = 0;
         node->next = nullptr;
         
@@ -86,71 +102,124 @@ public:
         return true;
     }
     
-    // Unpark one thread waiting on a lock address
-    // Returns true if a waiter was unparked, false otherwise
-    bool unpark_one(void* lock_address) {
-        usize bucket_index = hash_address(lock_address);
-        Bucket* bucket = &buckets_[bucket_index];
-        
-        // Lock the bucket
-        lock_bucket(bucket);
-        
-        // Remove one waiter from queue
-        WaiterNode* node = bucket->head;
-        if (node) {
-            bucket->head = node->next;
-            if (!bucket->head) {
-                bucket->tail = nullptr;
-            }
-            
-            // Set wake flag BEFORE unlocking bucket
-            // This ensures the waiter node is still valid when we wake it
-            atomic_store(&node->wake_flag, static_cast<u32>(1), MemoryOrder::release);
-            
-            // Unlock the bucket BEFORE waking
-            // This reduces bucket contention
-            unlock_bucket(bucket);
-            
-            // Wake the waiter
-            futex::wake(&node->wake_flag, 1);
-            
-            return true;
-        }
-        
-        // Unlock the bucket
-        unlock_bucket(bucket);
-        
-        return false;
+    // Default park without validation
+    bool park(const void* lock_address, WaiterNode* node) {
+        return park(lock_address, node, []() { return true; });
     }
     
-    // Unpark all threads waiting on a lock address
-    // Returns number of waiters unparked
-    usize unpark_all(void* lock_address) {
+    // Unpark one thread waiting on a lock address with callback under bucket lock
+    template<typename Callback>
+    UnparkResult unpark_one(const void* lock_address, Callback&& callback) {
         usize bucket_index = hash_address(lock_address);
         Bucket* bucket = &buckets_[bucket_index];
         
-        // Lock the bucket
         lock_bucket(bucket);
         
-        // Collect all waiters from queue
-        usize count = 0;
-        WaiterNode* node = bucket->head;
-        bucket->head = nullptr;
-        bucket->tail = nullptr;
+        WaiterNode* prev = nullptr;
+        WaiterNode* curr = bucket->head;
+        WaiterNode* target = nullptr;
         
-        // Unlock the bucket
+        while (curr) {
+            if (curr->key == lock_address) {
+                target = curr;
+                if (prev) {
+                    prev->next = curr->next;
+                } else {
+                    bucket->head = curr->next;
+                }
+                if (bucket->tail == curr) {
+                    bucket->tail = prev;
+                }
+                break;
+            }
+            prev = curr;
+            curr = curr->next;
+        }
+        
+        if (!target) {
+            callback(UnparkResult::None);
+            unlock_bucket(bucket);
+            return UnparkResult::None;
+        }
+        
+        // Check if there are more waiters for this key
+        bool has_more = false;
+        WaiterNode* check = bucket->head;
+        while (check) {
+            if (check->key == lock_address) {
+                has_more = true;
+                break;
+            }
+            check = check->next;
+        }
+        
+        UnparkResult result = has_more ? UnparkResult::HasMoreWaiters : UnparkResult::NoMoreWaiters;
+        
+        // Invoke callback under bucket lock before releasing and waking
+        callback(result);
+        
+        // Set wake flag BEFORE unlocking bucket
+        atomic_store(&target->wake_flag, static_cast<u32>(1), MemoryOrder::release);
         unlock_bucket(bucket);
         
-        // Wake all waiters
-        while (node) {
-            WaiterNode* next = node->next;
-            
-            // Set wake flag
-            atomic_store(&node->wake_flag, static_cast<u32>(1), MemoryOrder::release);
-            futex::wake(&node->wake_flag, 1);
-            
-            count++;
-            node = next;
+        // Wake the waiter
+        futex::wake(&target->wake_flag, 1);
+        return result;
+    }
+    
+    // Default unpark_one without callback
+    UnparkResult unpark_one(const void* lock_address) {
+        return unpark_one(lock_address, [](UnparkResult) {});
+    }
+    
+    // Unpark all threads waiting on a specific lock address
+    usize unpark_all(const void* lock_address) {
+        usize bucket_index = hash_address(lock_address);
+        Bucket* bucket = &buckets_[bucket_index];
+        
+        lock_bucket(bucket);
+        
+        WaiterNode* to_wake_head = nullptr;
+        WaiterNode* to_wake_tail = nullptr;
+        usize count = 0;
+        
+        WaiterNode* prev = nullptr;
+        WaiterNode* curr = bucket->head;
+        while (curr) {
+            WaiterNode* next = curr->next;
+            if (curr->key == lock_address) {
+                if (prev) {
+                    prev->next = next;
+                } else {
+                    bucket->head = next;
+                }
+                if (bucket->tail == curr) {
+                    bucket->tail = prev;
+                }
+                
+                curr->next = nullptr;
+                if (to_wake_tail) {
+                    to_wake_tail->next = curr;
+                } else {
+                    to_wake_head = curr;
+                }
+                to_wake_tail = curr;
+                count++;
+            } else {
+                prev = curr;
+            }
+            curr = next;
+        }
+        
+        unlock_bucket(bucket);
+        
+        // Wake all matching waiters outside bucket lock
+        curr = to_wake_head;
+        while (curr) {
+            WaiterNode* next = curr->next;
+            atomic_store(&curr->wake_flag, static_cast<u32>(1), MemoryOrder::release);
+            futex::wake(&curr->wake_flag, 1);
+            curr = next;
         }
         
         return count;
@@ -158,8 +227,7 @@ public:
     
 private:
     // Hash function for lock address
-    // Shift by 3 to align with cache line boundaries
-    static usize hash_address(void* address) {
+    static usize hash_address(const void* address) {
         usize addr = reinterpret_cast<usize>(address);
         return (addr >> 3) & (NUM_BUCKETS - 1);
     }
@@ -175,7 +243,6 @@ private:
                 MemoryOrder::acquire,
                 MemoryOrder::relaxed
             )) {
-                // Successfully locked bucket
                 return;
             }
             
@@ -218,8 +285,6 @@ public:
     MicroLock& operator=(const MicroLock&) = delete;
     
     // Acquire the microlock
-    // IMPORTANT: MicroLock must not be destroyed while threads are waiting on it
-    // The lock object must outlive all waiters
     void lock() {
         // Fast path: try to acquire uncontended lock
         u8 expected = UNLOCKED;
@@ -230,7 +295,6 @@ public:
             MemoryOrder::acquire,
             MemoryOrder::relaxed
         )) {
-            // Successfully acquired lock uncontended
             return;
         }
         
@@ -239,7 +303,6 @@ public:
     }
     
     // Try to acquire the microlock without blocking
-    // Returns true if lock was acquired, false otherwise
     bool try_lock() {
         u8 expected = UNLOCKED;
         return atomic_compare_exchange(
@@ -262,11 +325,7 @@ public:
     
 private:
     // Contended lock acquisition with parking
-    // NOTE: This implementation uses stack-allocated waiter nodes
-    // This is safe as long as the lock() function does not return while the thread is parked
-    // The parking lot ensures the waiter is removed from the queue before waking
     void lock_contended() {
-        // Thread-local waiter node (stack allocated)
         ParkingLot::WaiterNode node;
         
         while (true) {
@@ -274,7 +333,6 @@ private:
             for (usize i = 0; i < SPIN_INITIAL; ++i) {
                 cpu_pause();
                 
-                // Try to acquire lock
                 u8 expected = UNLOCKED;
                 if (atomic_compare_exchange(
                     &state_,
@@ -283,17 +341,26 @@ private:
                     MemoryOrder::acquire,
                     MemoryOrder::relaxed
                 )) {
-                    // Successfully acquired lock after spinning
                     return;
                 }
             }
             
-            // Park in parking lot
-            // The parking lot will remove the waiter from the queue before waking
-            // This ensures the waiter node is valid when accessed
-            get_parking_lot().park(this, &node);
+            // Park in parking lot with validation under bucket lock
+            get_parking_lot().park(this, &node, [this]() {
+                return atomic_load(&state_, MemoryOrder::relaxed) == LOCKED;
+            });
             
-            // After wake, retry acquisition
+            // After wake or if validation aborted, retry acquisition
+            u8 expected = UNLOCKED;
+            if (atomic_compare_exchange(
+                &state_,
+                &expected,
+                LOCKED,
+                MemoryOrder::acquire,
+                MemoryOrder::relaxed
+            )) {
+                return;
+            }
         }
     }
     

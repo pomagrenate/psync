@@ -20,6 +20,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
+#include <vector>
+#include <chrono>
+#include <atomic>
 
 using namespace psync;
 
@@ -408,6 +412,313 @@ static bool test_once_flag_call_once() {
 }
 
 // ============================================================================
+// MULTI-THREADED & ADVANCED CONCURRENCY TESTS
+// ============================================================================
+
+static bool test_locks_self_move() {
+    Mutex m;
+    {
+        UniqueLock<Mutex> ul(m);
+        ASSERT_TRUE(ul.owns_lock());
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wself-move"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
+#endif
+        ul = std::move(ul);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+        ASSERT_TRUE(ul.owns_lock());
+        ASSERT_FALSE(m.try_lock());
+        ul.unlock();
+        ASSERT_FALSE(ul.owns_lock());
+        ASSERT_TRUE(m.try_lock());
+        m.unlock();
+    }
+    
+    SharedMutex sm;
+    {
+        SharedLock<SharedMutex> sl(sm);
+        ASSERT_TRUE(sl.owns_lock());
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wself-move"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
+#endif
+        sl = std::move(sl);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+        ASSERT_TRUE(sl.owns_lock());
+        ASSERT_FALSE(sm.try_lock());
+        sl.unlock();
+        ASSERT_FALSE(sl.owns_lock());
+        ASSERT_TRUE(sm.try_lock());
+        sm.unlock();
+    }
+    return true;
+}
+
+static bool test_seqlock_read_transaction_and_concurrency() {
+    SeqLock seqlock;
+    struct InvariantData {
+        u64 a;
+        u64 b;
+    } data{500, 500};
+    
+    std::atomic<bool> stop{false};
+    std::atomic<u64> read_count{0};
+    std::atomic<bool> invariant_broken{false};
+    
+    // Writer thread repeatedly updating a and b maintaining a + b == 1000
+    std::thread writer([&]() {
+        u64 step = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            step++;
+            u64 val = step % 1000;
+            seqlock.write_begin();
+            data.a = val;
+            data.b = 1000 - val;
+            seqlock.write_end();
+        }
+    });
+    
+    // 4 Reader threads continuously checking invariant via read_transaction
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto snap = read_transaction(seqlock, [&]() {
+                    return data;
+                });
+                if (snap.a + snap.b != 1000) {
+                    invariant_broken.store(true, std::memory_order_relaxed);
+                }
+                read_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stop.store(true, std::memory_order_relaxed);
+    
+    writer.join();
+    for (auto& r : readers) {
+        r.join();
+    }
+    
+    ASSERT_FALSE(invariant_broken.load());
+    ASSERT_TRUE(read_count.load() > 500);
+    return true;
+}
+
+static bool test_mutex_multithreaded() {
+    Mutex m;
+    u64 count = 0;
+    constexpr int num_threads = 4;
+    constexpr int iters = 5000;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&]() {
+            for (int i = 0; i < iters; ++i) {
+                LockGuard<Mutex> g(m);
+                count++;
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+    ASSERT_EQ(count, static_cast<u64>(num_threads * iters));
+    return true;
+}
+
+static bool test_microlock_multithreaded_contention() {
+    MicroLock lock1;
+    MicroLock lock2;
+    u64 count1 = 0;
+    u64 count2 = 0;
+    
+    constexpr int num_threads = 4;
+    constexpr int iters_per_thread = 5000;
+    std::vector<std::thread> threads;
+    
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < iters_per_thread; ++i) {
+                if (t % 2 == 0) {
+                    MicroLockGuard g(lock1);
+                    count1++;
+                } else {
+                    MicroLockGuard g(lock2);
+                    count2++;
+                }
+            }
+        });
+    }
+    
+    for (auto& th : threads) {
+        th.join();
+    }
+    
+    ASSERT_EQ(count1, static_cast<u64>((num_threads / 2) * iters_per_thread));
+    ASSERT_EQ(count2, static_cast<u64>((num_threads - (num_threads / 2)) * iters_per_thread));
+    return true;
+}
+
+static bool test_shared_mutex_multithreaded() {
+    SharedMutex sm;
+    u64 shared_val = 0;
+    std::atomic<bool> stop{false};
+    std::atomic<u64> reads{0};
+    
+    std::vector<std::thread> writers;
+    for (int w = 0; w < 2; ++w) {
+        writers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                UniqueLock<SharedMutex> lock(sm);
+                shared_val++;
+            }
+        });
+    }
+    
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r) {
+        readers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                SharedLock<SharedMutex> lock(sm);
+                u64 v = shared_val;
+                (void)v;
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stop.store(true, std::memory_order_relaxed);
+    
+    for (auto& wr : writers) wr.join();
+    for (auto& rd : readers) rd.join();
+    
+    ASSERT_TRUE(shared_val > 0);
+    ASSERT_TRUE(reads.load() > 0);
+    return true;
+}
+
+static bool test_condvar_multithreaded_and_timeout() {
+    ConditionVariable cv;
+    Mutex m;
+    
+    // 1. Timed wait test - timeout case
+    {
+        UniqueLock<Mutex> lock(m);
+        auto start = std::chrono::steady_clock::now();
+        bool signaled = cv.wait_for(lock, std::chrono::milliseconds(20), []() { return false; });
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        ASSERT_FALSE(signaled);
+        ASSERT_TRUE(elapsed >= 15);
+    }
+    
+    // 2. Timed wait test - success case
+    {
+        bool ready = false;
+        std::thread waiter([&]() {
+            UniqueLock<Mutex> lock(m);
+            cv.wait_for(lock, std::chrono::seconds(2), [&]() { return ready; });
+        });
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        {
+            UniqueLock<Mutex> lock(m);
+            ready = true;
+            cv.notify_one();
+        }
+        waiter.join();
+        ASSERT_TRUE(ready);
+    }
+    
+    // 3. Multi-threaded Producer-Consumer queue
+    {
+        std::vector<int> queue;
+        bool done = false;
+        constexpr int total_items = 200;
+        int items_consumed = 0;
+        
+        std::thread consumer([&]() {
+            while (true) {
+                UniqueLock<Mutex> lock(m);
+                cv.wait(lock, [&]() { return !queue.empty() || done; });
+                while (!queue.empty()) {
+                    queue.pop_back();
+                    items_consumed++;
+                }
+                if (done && queue.empty()) {
+                    break;
+                }
+            }
+        });
+        
+        for (int i = 0; i < total_items; ++i) {
+            {
+                UniqueLock<Mutex> lock(m);
+                queue.push_back(i);
+                cv.notify_one();
+            }
+        }
+        
+        {
+            UniqueLock<Mutex> lock(m);
+            done = true;
+            cv.notify_all();
+        }
+        
+        consumer.join();
+        ASSERT_EQ(items_consumed, total_items);
+    }
+    
+    return true;
+}
+
+static bool test_tagged_ptr_multithreaded_contention() {
+    struct CounterData {
+        u64 count;
+        u64 pad[7];
+    };
+    CounterData cdata{0, {0}};
+    TaggedLockPtr<CounterData> lock_ptr(&cdata);
+    
+    constexpr int num_threads = 4;
+    constexpr int iters_per_thread = 5000;
+    std::vector<std::thread> threads;
+    
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&]() {
+            for (int i = 0; i < iters_per_thread; ++i) {
+                lock_ptr.lock();
+                lock_ptr.get()->count++;
+                lock_ptr.unlock();
+            }
+        });
+    }
+    
+    for (auto& th : threads) {
+        th.join();
+    }
+    
+    ASSERT_EQ(lock_ptr.get()->count, static_cast<u64>(num_threads * iters_per_thread));
+    return true;
+}
+
+// ============================================================================
 // MAIN TEST RUNNER
 // ============================================================================
 
@@ -420,15 +731,19 @@ int main() {
     
     printf("\n--- Mutex Tests ---\n");
     TEST(mutex_single_thread);
+    TEST(mutex_multithreaded);
     
     printf("\n--- MicroLock Tests ---\n");
     TEST(microlock_single_thread);
+    TEST(microlock_multithreaded_contention);
     
     printf("\n--- SeqLock Tests ---\n");
     TEST(seqlock_single_thread);
+    TEST(seqlock_read_transaction_and_concurrency);
     
     printf("\n--- Shared Mutex Tests ---\n");
     TEST(shared_mutex_single_thread);
+    TEST(shared_mutex_multithreaded);
     
     printf("\n--- Batch Tests ---\n");
     TEST(batch_guard);
@@ -438,15 +753,18 @@ int main() {
     
     printf("\n--- Condition Variable Tests ---\n");
     TEST(condvar_single_thread);
+    TEST(condvar_multithreaded_and_timeout);
     
     printf("\n--- Generic RAII Lock Tests ---\n");
     TEST(generic_locks);
+    TEST(locks_self_move);
 
     printf("\n--- OnceFlag / CallOnce Tests ---\n");
     TEST(once_flag_call_once);
     
     printf("\n--- Tagged Pointer Tests ---\n");
     TEST(tagged_ptr_single_thread);
+    TEST(tagged_ptr_multithreaded_contention);
     
     printf("\n=== TEST SUMMARY ===\n");
     printf("Passed: %zu\n", tests_passed);

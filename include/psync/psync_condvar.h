@@ -7,19 +7,27 @@
 
 #include "psync_platform.h"
 
+#include <chrono>
+
 namespace psync {
+
+// Condition variable status for timed waits
+enum class cv_status {
+    no_timeout,
+    timeout
+};
 
 // ============================================================================
 // CONDITION VARIABLE
 // ============================================================================
-// Simple futex-based condition variable for both Linux and Windows
-// Requires predicate re-checking by caller (standard condition variable semantics)
+// Zero-libc, futex-backed condition variable for both Linux and Windows.
+// Uses sequence/generation counter to eliminate lost wakeups completely.
 // ============================================================================
 
 class ConditionVariable {
 public:
     // Initialize condition variable
-    constexpr ConditionVariable() : state_(EMPTY) {}
+    constexpr ConditionVariable() : seq_(0) {}
     
     // Disable copy and move
     ConditionVariable(const ConditionVariable&) = delete;
@@ -36,9 +44,9 @@ public:
     // Wait on condition variable using any Lock type (e.g. UniqueLock<Mutex>)
     template<typename LockType>
     void wait(LockType& lock) {
-        u32 current = atomic_fetch_or(&state_, WAITERS, MemoryOrder::relaxed);
+        u32 seq = atomic_load(&seq_, MemoryOrder::relaxed);
         lock.unlock();
-        futex::wait(&state_, current | WAITERS);
+        futex::wait(&seq_, seq);
         lock.lock();
     }
 
@@ -52,15 +60,63 @@ public:
     
     // Wait on condition variable for raw Mutex
     void wait(Mutex& mutex) {
-        u32 current = atomic_fetch_or(&state_, WAITERS, MemoryOrder::relaxed);
+        u32 seq = atomic_load(&seq_, MemoryOrder::relaxed);
         mutex.unlock();
-        futex::wait(&state_, current | WAITERS);
+        futex::wait(&seq_, seq);
         mutex.lock();
+    }
+
+    // Timed wait with relative duration
+    template<typename LockType, typename Rep, typename Period>
+    cv_status wait_for(LockType& lock, const std::chrono::duration<Rep, Period>& rel_time) {
+        u32 seq = atomic_load(&seq_, MemoryOrder::relaxed);
+        lock.unlock();
+        u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(rel_time).count());
+        futex::wait_for(&seq_, seq, ns);
+        lock.lock();
+        return (atomic_load(&seq_, MemoryOrder::relaxed) == seq) ? cv_status::timeout : cv_status::no_timeout;
+    }
+
+    // Timed wait with predicate and relative duration
+    template<typename LockType, typename Rep, typename Period, typename Predicate>
+    bool wait_for(LockType& lock, const std::chrono::duration<Rep, Period>& rel_time, Predicate pred) {
+        auto deadline = std::chrono::steady_clock::now() + rel_time;
+        while (!pred()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return pred();
+            }
+            wait_for(lock, deadline - now);
+        }
+        return true;
+    }
+
+    // Timed wait with absolute time point
+    template<typename LockType, typename Clock, typename Duration>
+    cv_status wait_until(LockType& lock, const std::chrono::time_point<Clock, Duration>& timeout_time) {
+        auto now = Clock::now();
+        if (now >= timeout_time) {
+            return cv_status::timeout;
+        }
+        return wait_for(lock, timeout_time - now);
+    }
+
+    // Timed wait with predicate and absolute time point
+    template<typename LockType, typename Clock, typename Duration, typename Predicate>
+    bool wait_until(LockType& lock, const std::chrono::time_point<Clock, Duration>& timeout_time, Predicate pred) {
+        while (!pred()) {
+            if (Clock::now() >= timeout_time) {
+                return pred();
+            }
+            wait_until(lock, timeout_time);
+        }
+        return true;
     }
     
     // Wake one waiting thread
     void signal() {
-        futex::wake(&state_, 1);
+        atomic_fetch_add(&seq_, 1u, MemoryOrder::release);
+        futex::wake(&seq_, 1);
     }
     
     // Standard alias for signal()
@@ -71,42 +127,19 @@ public:
     // Wake all waiting threads
     void broadcast(Mutex& mutex) {
 #ifdef PSYNC_PLATFORM_LINUX
-        // Linux: Use FUTEX_CMP_REQUEUE_PRIVATE for thundering herd mitigation
-        u32 current = atomic_load(&state_, MemoryOrder::relaxed);
-        if ((current & WAITERS) == 0) {
-            return;
-        }
-        
-        u32 expected = current;
-        while (true) {
-            u32 new_state = current & ~WAITERS;
-            if (atomic_compare_exchange(
-                &state_,
-                &expected,
-                new_state,
-                MemoryOrder::relaxed,
-                MemoryOrder::relaxed
-            )) {
-                volatile u32* mutex_state = mutex.get_state_address();
-                futex::requeue(&state_, mutex_state, 0x7fffffff, current);
-                return;
-            }
-            current = expected;
-            
-            if ((current & WAITERS) == 0) {
-                return;
-            }
-        }
+        u32 old_seq = atomic_fetch_add(&seq_, 1u, MemoryOrder::release);
+        volatile u32* mutex_state = mutex.get_state_address();
+        futex::requeue(&seq_, mutex_state, 0x7fffffff, old_seq);
 #else
-        (void)mutex; // Suppress unused parameter warning on Windows
-        // Windows: Wake all (thundering herd on Windows is acceptable fallback)
-        futex::wake_all(&state_);
+        (void)mutex;
+        broadcast();
 #endif
     }
     
     // Wake all waiting threads (simplified version without mutex)
     void broadcast() {
-        futex::wake_all(&state_);
+        atomic_fetch_add(&seq_, 1u, MemoryOrder::release);
+        futex::wake_all(&seq_);
     }
 
     // Standard alias for broadcast()
@@ -119,9 +152,7 @@ public:
     }
     
 private:
-    volatile u32 state_;
-    static constexpr u32 EMPTY = 0x00000000u;
-    static constexpr u32 WAITERS = 0x00000001u;
+    volatile u32 seq_;
 };
 
 // ============================================================================
