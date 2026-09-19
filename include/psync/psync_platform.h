@@ -399,13 +399,14 @@ inline i32 wait_for(volatile u32* uaddr, u32 val, u64 timeout_ns) {
 // Wake up to count waiters on futex
 // Returns number of waiters woken
 inline i32 wake(volatile u32* uaddr, i32 count) {
-    i32 result = futex_syscall(uaddr, FUTEX_WAKE_PRIVATE, static_cast<u32>(count));
+    u32 wake_count = (count <= 0) ? 0x7fffffffu : static_cast<u32>(count);
+    i32 result = futex_syscall(uaddr, FUTEX_WAKE_PRIVATE, wake_count);
     return result;
 }
 
 // Wake all waiters on futex
 inline i32 wake_all(volatile u32* uaddr) {
-    return wake(uaddr, -1);
+    return wake(uaddr, 0x7fffffff);
 }
 
 // Requeue waiters from one futex to another (Linux only)
