@@ -236,25 +236,16 @@ private:
                     continue;
                 }
                 
-                // Lock is still locked, ensure waiters flag is set
-                if ((current & WAITERS_BIT) == 0) {
-                    u64 new_state = current | WAITERS_BIT;
-                    u64 expected = current;
-                    if (!atomic_compare_exchange(
-                        &tagged_ptr_,
-                        &expected,
-                        new_state,
-                        MemoryOrder::relaxed,
-                        MemoryOrder::relaxed
-                    )) {
-                        // CAS failed, retry
-                        continue;
-                    }
-                }
-                
-                // Waiters flag is set, park in parking lot with validation under bucket lock
+                // Park in parking lot with atomic validation & WAITERS_BIT setting under bucket lock
                 get_parking_lot().park(this, &node, [this]() {
-                    return (atomic_load(&tagged_ptr_, MemoryOrder::relaxed) & LOCKED_BIT) != 0;
+                    u64 cur = atomic_load(&tagged_ptr_, MemoryOrder::relaxed);
+                    if ((cur & LOCKED_BIT) == 0) {
+                        return false; // Already unlocked, do not park
+                    }
+                    if ((cur & WAITERS_BIT) == 0) {
+                        atomic_fetch_or(&tagged_ptr_, WAITERS_BIT, MemoryOrder::relaxed);
+                    }
+                    return true;
                 });
                 break;
             }

@@ -22,6 +22,15 @@
     #include <sched.h>
     #include <pthread.h>
     #include <time.h>
+#elif defined(__APPLE__)
+    #ifndef PSYNC_PLATFORM_DARWIN
+        #define PSYNC_PLATFORM_DARWIN
+    #endif
+    #include <errno.h>
+    #include <unistd.h>
+    #include <sched.h>
+    #include <pthread.h>
+    #include <time.h>
 #elif defined(_WIN32) || defined(_WIN64)
     #ifndef PSYNC_PLATFORM_WINDOWS
         #define PSYNC_PLATFORM_WINDOWS
@@ -102,19 +111,46 @@ enum class MemoryOrder {
 #endif
 
 // ============================================================================
-// CPU INTRINSICS (x86-64)
+// HARDWARE CONSTANTS
+// ============================================================================
+
+#if (defined(__APPLE__) && defined(__aarch64__)) || defined(__ARM_ARCH_ISA_A64)
+constexpr usize kDestructiveInterferenceSize = 128;
+constexpr usize kConstructiveInterferenceSize = 128;
+#else
+constexpr usize kDestructiveInterferenceSize = 64;
+constexpr usize kConstructiveInterferenceSize = 64;
+#endif
+
+// ============================================================================
+// CPU INTRINSICS (x86-64, ARM64, RISC-V)
 // ============================================================================
 
 inline void cpu_pause() {
-    // x86-64 pause instruction
-    // Reduces power consumption in spin loops
-    // Improves hyperthreading performance
+    // Multi-architecture spin pause:
+    // x86-64: pause
+    // ARM64:  yield
+    // RISC-V: pause (hint)
 #if defined(__GNUC__) || defined(__clang__)
-    __asm__ volatile("pause" ::: "memory");
+    #if defined(__aarch64__) || defined(_M_ARM64)
+        __asm__ volatile("yield" ::: "memory");
+    #elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        __asm__ volatile("pause" ::: "memory");
+    #elif defined(__riscv)
+        __asm__ volatile("pause" ::: "memory");
+    #else
+        __asm__ volatile("" ::: "memory");
+    #endif
 #elif defined(_MSC_VER)
-    _mm_pause();
+    #if defined(_M_ARM64) || defined(_M_ARM)
+        __yield();
+    #elif defined(_M_IX86) || defined(_M_X64)
+        _mm_pause();
+    #else
+        YieldProcessor();
+    #endif
 #else
-    #error "Unsupported compiler for cpu_pause"
+    compiler_fence();
 #endif
 }
 
@@ -347,9 +383,19 @@ constexpr u32 FUTEX_WAKE_PRIVATE = FUTEX_WAKE | FUTEX_PRIVATE_FLAG;
 constexpr u32 FUTEX_REQUEUE_PRIVATE = FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG;
 constexpr u32 FUTEX_CMP_REQUEUE_PRIVATE = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG;
 
-// Syscall number for futex (x86-64)
+// Syscall number for futex across architectures
 #if defined(SYS_futex)
 constexpr usize SYS_FUTEX = static_cast<usize>(SYS_futex);
+#elif defined(__NR_futex)
+constexpr usize SYS_FUTEX = static_cast<usize>(__NR_futex);
+#elif defined(__aarch64__)
+constexpr usize SYS_FUTEX = 98;
+#elif defined(__riscv)
+constexpr usize SYS_FUTEX = 422;
+#elif defined(__x86_64__)
+constexpr usize SYS_FUTEX = 202;
+#elif defined(__i386__)
+constexpr usize SYS_FUTEX = 240;
 #else
 constexpr usize SYS_FUTEX = 202;
 #endif
@@ -413,16 +459,70 @@ inline i32 wake_all(volatile u32* uaddr) {
 // Used for thundering herd mitigation in condition variables
 // Uses FUTEX_CMP_REQUEUE_PRIVATE to verify condvar state before requeueing
 inline i32 requeue(volatile u32* uaddr, volatile u32* uaddr2, i32 count, u32 expected) {
-#ifdef PSYNC_PLATFORM_LINUX
     return futex_syscall(uaddr, FUTEX_CMP_REQUEUE_PRIVATE, 1,
                          reinterpret_cast<const timespec*>(static_cast<uintptr_t>(count)),
                          uaddr2, expected);
-#else
-    // Fallback for non-Linux: wake all (causes thundering herd)
-    (void)expected;  // Suppress unused parameter warning
-    return wake_all(uaddr);
-#endif
 }
+
+// Process-shared futex primitives (omitting FUTEX_PRIVATE_FLAG) for IPC shared memory
+inline i32 wait_shared(volatile u32* uaddr, u32 val) {
+    return futex_syscall(uaddr, FUTEX_WAIT, val);
+}
+inline i32 wake_shared(volatile u32* uaddr, i32 count) {
+    u32 wake_count = (count <= 0) ? 0x7fffffffu : static_cast<u32>(count);
+    return futex_syscall(uaddr, FUTEX_WAKE, wake_count);
+}
+inline i32 wake_all_shared(volatile u32* uaddr) {
+    return wake_shared(uaddr, 0x7fffffff);
+}
+
+#elif defined(PSYNC_PLATFORM_DARWIN)
+
+// Darwin __ulock kernel primitives (macOS 10.12+, iOS 10+)
+extern "C" {
+    int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us);
+    int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value);
+}
+
+constexpr uint32_t UL_COMPARE_AND_WAIT = 1;
+constexpr uint32_t ULF_WAKE_ALL = 0x00000100;
+
+inline i32 wait(volatile u32* uaddr, u32 val) {
+    int ret = __ulock_wait(UL_COMPARE_AND_WAIT, const_cast<u32*>(uaddr), val, 0);
+    return ret >= 0 ? 0 : -errno;
+}
+
+inline i32 wait_for(volatile u32* uaddr, u32 val, u64 timeout_ns) {
+    uint32_t timeout_us = static_cast<uint32_t>(timeout_ns / 1000);
+    if (timeout_us == 0 && timeout_ns > 0) timeout_us = 1;
+    int ret = __ulock_wait(UL_COMPARE_AND_WAIT, const_cast<u32*>(uaddr), val, timeout_us);
+    return ret >= 0 ? 0 : -errno;
+}
+
+inline i32 wake(volatile u32* uaddr, i32 count) {
+    if (count <= 0 || count > 1) {
+        int ret = __ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL, const_cast<u32*>(uaddr), 0);
+        return ret >= 0 ? 1 : -errno;
+    } else {
+        int ret = __ulock_wake(UL_COMPARE_AND_WAIT, const_cast<u32*>(uaddr), 0);
+        return ret >= 0 ? 1 : -errno;
+    }
+}
+
+inline i32 wake_all(volatile u32* uaddr) {
+    return wake(uaddr, 0x7fffffff);
+}
+
+inline i32 requeue(volatile u32* uaddr, volatile u32* uaddr2, i32 count, u32 expected) {
+    (void)uaddr2;
+    (void)count;
+    (void)expected;
+    return wake_all(uaddr);
+}
+
+inline i32 wait_shared(volatile u32* uaddr, u32 val) { return wait(uaddr, val); }
+inline i32 wake_shared(volatile u32* uaddr, i32 count) { return wake(uaddr, count); }
+inline i32 wake_all_shared(volatile u32* uaddr) { return wake_all(uaddr); }
 
 #elif defined(PSYNC_PLATFORM_WINDOWS)
 
@@ -448,41 +548,43 @@ static WaitOnAddressFunc s_wait_on_address = nullptr;
 static WakeByAddressSingleFunc s_wake_by_address_single = nullptr;
 static WakeByAddressAllFunc s_wake_by_address_all = nullptr;
 
-static bool s_initialized = false;
+static volatile LONG s_futex_init_state = 0; // 0 = uninit, 1 = initializing, 2 = done
 
 static void init_futex_windows() {
-    if (s_initialized) return;
+    if (s_futex_init_state == 2) return;
     
+    if (InterlockedCompareExchange(&s_futex_init_state, 1, 0) == 0) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcast-function-type"
 #endif
-    HMODULE hmod = GetModuleHandleA("kernelbase.dll");
-    if (!hmod) {
-        hmod = GetModuleHandleA("api-ms-win-core-synch-l1-2-0.dll");
-    }
-    if (!hmod) {
-        hmod = LoadLibraryA("api-ms-win-core-synch-l1-2-0.dll");
-    }
-    if (!hmod) {
-        hmod = GetModuleHandleA("kernel32.dll");
-    }
-    if (hmod) {
-        s_wait_on_address = reinterpret_cast<WaitOnAddressFunc>(
-            GetProcAddress(hmod, "WaitOnAddress")
-        );
-        s_wake_by_address_single = reinterpret_cast<WakeByAddressSingleFunc>(
-            GetProcAddress(hmod, "WakeByAddressSingle")
-        );
-        s_wake_by_address_all = reinterpret_cast<WakeByAddressAllFunc>(
-            GetProcAddress(hmod, "WakeByAddressAll")
-        );
-    }
+        HMODULE hmod = GetModuleHandleA("kernelbase.dll");
+        if (!hmod) {
+            hmod = GetModuleHandleA("kernel32.dll");
+        }
+        if (!hmod) {
+            hmod = LoadLibraryA("api-ms-win-core-synch-l1-2-0.dll");
+        }
+        if (hmod) {
+            s_wait_on_address = reinterpret_cast<WaitOnAddressFunc>(
+                GetProcAddress(hmod, "WaitOnAddress")
+            );
+            s_wake_by_address_single = reinterpret_cast<WakeByAddressSingleFunc>(
+                GetProcAddress(hmod, "WakeByAddressSingle")
+            );
+            s_wake_by_address_all = reinterpret_cast<WakeByAddressAllFunc>(
+                GetProcAddress(hmod, "WakeByAddressAll")
+            );
+        }
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-    
-    s_initialized = true;
+        InterlockedExchange(&s_futex_init_state, 2);
+    } else {
+        while (s_futex_init_state != 2) {
+            cpu_pause();
+        }
+    }
 }
 
 // Fallback using Windows SRWLock and Condition Variable
@@ -634,6 +736,17 @@ inline i32 wake_all(volatile u32* uaddr) {
     return wake(uaddr, -1);
 }
 
+inline i32 requeue(volatile u32* uaddr, volatile u32* uaddr2, i32 count, u32 expected) {
+    (void)uaddr2;
+    (void)count;
+    (void)expected;
+    return wake_all(uaddr);
+}
+
+inline i32 wait_shared(volatile u32* uaddr, u32 val) { return wait(uaddr, val); }
+inline i32 wake_shared(volatile u32* uaddr, i32 count) { return wake(uaddr, count); }
+inline i32 wake_all_shared(volatile u32* uaddr) { return wake_all(uaddr); }
+
 #else
     #error "Unsupported platform for futex"
 #endif
@@ -747,6 +860,7 @@ inline usize get_hardware_concurrency() {
 
 #ifdef PSYNC_TEST_BUILD
 inline void assert_internal(bool condition, const char* msg) {
+    (void)msg;
     if (!condition) {
         // Minimal assertion for testing
 #if defined(__GNUC__) || defined(__clang__)
