@@ -6,13 +6,22 @@
 // Secondary target: Windows (for development/testing)
 // Compilers: GCC, Clang, MSVC
 
+// Standard C++ headers required across platforms
+#include <cstddef>
+#include <cstdint>
+#include <ctime>
+
 // Platform detection and headers must come first
 #if defined(__linux__)
     #ifndef PSYNC_PLATFORM_LINUX
         #define PSYNC_PLATFORM_LINUX
     #endif
     #include <errno.h>
-    #include <cstdint>
+    #include <sys/syscall.h>
+    #include <unistd.h>
+    #include <sched.h>
+    #include <pthread.h>
+    #include <time.h>
 #elif defined(_WIN32) || defined(_WIN64)
     #ifndef PSYNC_PLATFORM_WINDOWS
         #define PSYNC_PLATFORM_WINDOWS
@@ -25,7 +34,7 @@
     #define NOMINMAX
     #endif
     #include <windows.h>
-    #include <cstdint>
+    #include <processthreadsapi.h>
 
     // Undefine intrusive Windows macros that collide with standard C++ APIs and methods
     #ifdef DeleteFile
@@ -339,13 +348,21 @@ constexpr u32 FUTEX_REQUEUE_PRIVATE = FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG;
 constexpr u32 FUTEX_CMP_REQUEUE_PRIVATE = FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG;
 
 // Syscall number for futex (x86-64)
+#if defined(SYS_futex)
+constexpr usize SYS_FUTEX = static_cast<usize>(SYS_futex);
+#else
 constexpr usize SYS_FUTEX = 202;
+#endif
 
 // Timeout for futex_wait (NULL = block indefinitely)
+#if defined(PSYNC_PLATFORM_LINUX)
+using timespec = struct ::timespec;
+#else
 struct timespec {
     i64 tv_sec;
     i64 tv_nsec;
 };
+#endif
 
 // Raw futex syscall wrapper
 inline i32 futex_syscall(
@@ -665,9 +682,6 @@ namespace thread {
 
 #ifdef PSYNC_PLATFORM_LINUX
 
-#include <pthread.h>
-#include <unistd.h>
-
 using thread_handle = pthread_t;
 
 inline bool thread_create(thread_handle* handle, void (*func)(void*), void* arg) {
@@ -688,9 +702,6 @@ inline usize get_hardware_concurrency() {
 }
 
 #elif defined(PSYNC_PLATFORM_WINDOWS)
-
-#include <windows.h>
-#include <processthreadsapi.h>
 
 using thread_handle = HANDLE;
 

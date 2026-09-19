@@ -723,6 +723,7 @@ static bool test_tagged_ptr_multithreaded_contention() {
 // ============================================================================
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("=== PSYNC SYNCHRONIZATION LIBRARY TESTS ===\n\n");
     
     printf("--- Platform Tests ---\n");
