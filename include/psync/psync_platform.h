@@ -373,23 +373,8 @@ inline i32 futex_syscall(
     volatile u32* uaddr2 = nullptr,
     u32 val3 = 0
 ) {
-    register i64 r10 __asm__("r10") = reinterpret_cast<i64>(timeout);
-    register i64 r8  __asm__("r8")  = reinterpret_cast<i64>(uaddr2);
-    register i64 r9  __asm__("r9")  = static_cast<i64>(val3);
-    i32 result;
-    __asm__ volatile(
-        "syscall"
-        : "=a"(result)
-        : "a"(SYS_FUTEX),
-          "D"(uaddr),
-          "S"(futex_op),
-          "d"(val),
-          "r"(r10),
-          "r"(r8),
-          "r"(r9)
-        : "rcx", "r11", "memory"
-    );
-    return result;
+    long result = ::syscall(SYS_FUTEX, uaddr, futex_op, val, timeout, uaddr2, val3);
+    return (result < 0) ? -errno : static_cast<i32>(result);
 }
 
 // Wait on futex if *uaddr == val
